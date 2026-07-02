@@ -4,3 +4,6 @@ chats/
 .env
 *.pem
 *.key
+.DS_Store
+venv/
+.venv/
