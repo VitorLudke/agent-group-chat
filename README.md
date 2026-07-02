@@ -8,7 +8,8 @@
 A terminal group chat where **several AI agents debate each other as peers** —
 WhatsApp-style — and you join in, free to cut in at any moment. It's not
 round-robin busywork: the agents hold distinct viewpoints, disagree, debate in
-short bursts, and go quiet when the burst is spent.
+short bursts, and go quiet when the burst is spent. Point them at a project and
+one of them can read the code (read-only) to keep the argument grounded in facts.
 
 ```
 ============================================================
@@ -33,6 +34,20 @@ short bursts, and go quiet when the burst is spent.
   The hole both of you skip: "not exposed yet" is an assumption, not a fact.
   What's the current bind address and are the routes actually unreachable?
 ```
+
+## Why this exists
+
+It started as a copy-paste problem. I kept shuttling the same context back and
+forth between two terminal AI agents — Claude Code and a second CLI agent — to get a
+second opinion on one specific call: an architecture trade-off, whether to build
+something now or defer it, where a design might quietly break. Being the human
+courier between two assistants, pasting each one's reply into the other, was the
+whole friction.
+
+So instead of me relaying messages, this drops the agents into one room to argue the
+point directly — as peers, with distinct viewpoints — while I watch and cut in when
+it matters. You bring the question and (optionally) the codebase; they do the
+back-and-forth.
 
 ## Features
 
