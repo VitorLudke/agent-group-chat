@@ -31,8 +31,70 @@ from chat import (
     GREEN, CYAN, YELLOW, MAGENTA, RED, RESET, DIM, BOLD,
 )
 
+try:                     # POSIX-only; absent on Windows
+    import termios
+    import tty
+    _HAS_TERMIOS = True
+except ImportError:
+    _HAS_TERMIOS = False
+
 _EOF = object()
 EXIT_WORDS = ("exit", "quit", "/q")
+
+
+class LineEditor:
+    """Pure keystroke state machine for one input line — no terminal I/O, so it's
+    unit-testable. Feed decoded text (from a raw/cbreak fd); get back completed
+    lines. Handles printable chars, backspace, Enter, bracketed paste (a multi-line
+    paste becomes ONE pending line, kept until you press Enter), and swallows other
+    escape sequences (arrow keys, Home/End, ...) so they don't corrupt the buffer.
+    """
+    _PASTE_START = "\x1b[200~"
+    _PASTE_END = "\x1b[201~"
+
+    def __init__(self):
+        self.buf = ""
+        self._esc = ""          # in-progress escape sequence (may span reads)
+        self._in_paste = False
+
+    def feed(self, text):
+        """Consume text; return (lines, eof). `lines` are completed input lines;
+        `eof` is True if Ctrl-D was pressed on an empty buffer."""
+        lines, eof = [], False
+        for ch in text:
+            if self._esc:
+                self._esc += ch
+                # CSI: ESC [ params... final(0x40-0x7e). The '[' introducer is
+                # itself in 0x40-0x7e, so a final byte only counts once there is
+                # at least one char after the '[' (len >= 3).
+                if self._esc[1:2] == "[":
+                    if len(self._esc) >= 3 and "\x40" <= ch <= "\x7e":
+                        seq, self._esc = self._esc, ""
+                        if seq == self._PASTE_START:
+                            self._in_paste = True
+                        elif seq == self._PASTE_END:
+                            self._in_paste = False
+                        # else: arrow / navigation CSI -> swallow
+                elif len(self._esc) >= 2:
+                    self._esc = ""     # short non-CSI escape (ESC + one char) -> swallow
+                continue
+            if ch == "\x1b":
+                self._esc = ch
+                continue
+            if self._in_paste:
+                self.buf += "\n" if ch in ("\r", "\n") else ch
+                continue
+            if ch in ("\r", "\n"):
+                lines.append(self.buf)
+                self.buf = ""
+            elif ch in ("\x7f", "\x08"):        # backspace / delete
+                self.buf = self.buf[:-1]
+            elif ch == "\x04":                  # Ctrl-D
+                if not self.buf:
+                    eof = True
+            elif ch == "\t" or ord(ch) >= 32:   # printable (control chars ignored)
+                self.buf += ch
+        return lines, eof
 
 
 class UserInputThread(threading.Thread):
@@ -192,6 +254,117 @@ def build_participants(args, project_dir):
     return participants, names
 
 
+def _save(history, args, default_dir):
+    save_path = args.save or str(default_dir / f"chat-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md")
+    save_chat(history, save_path)
+
+
+def run_piped(loop, history, args, default_dir):
+    """Line-based loop for pipes / redirected input / non-tty (tests, CI)."""
+    inp = UserInputThread()
+    inp.start()
+
+    def handle_user(item):
+        if item is _EOF:
+            return False
+        if item.strip().lower() in EXIT_WORDS:
+            return False
+        if item.strip():
+            loop.post_user_message(item)
+            print_msg(history.messages[-1])
+        return True
+
+    try:
+        while True:
+            item = inp.get_input()               # drain user input before an agent turn
+            if item is not None:
+                if not handle_user(item):
+                    break
+                continue
+            msg = loop.step()                    # one agent turn, if the burst isn't spent
+            if msg is not None:
+                print_done()
+                print_msg(msg)
+                time.sleep(args.delay)
+                continue
+            if not handle_user(inp.wait_for_input()):   # idle: wait for the user
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        inp.stop()
+        _save(history, args, default_dir)
+
+
+def run_interactive(loop, history, args, default_dir):
+    """Raw-mode (cbreak) input line: what you type survives agent output, arrow
+    keys don't corrupt the buffer, and a multi-line paste becomes one message.
+    The terminal is restored on every exit path (finally + atexit + signals)."""
+    import atexit
+    import select
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    editor = LineEditor()
+
+    def restore():
+        try:
+            sys.stdout.write("\x1b[?2004l")          # disable bracketed paste
+            sys.stdout.flush()
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass
+    atexit.register(restore)
+
+    def redraw():
+        # collapse a multi-line (pasted) buffer onto one prompt line
+        sys.stdout.write("\r\x1b[K> " + editor.buf.replace("\n", " ⏎ "))
+        sys.stdout.flush()
+
+    def emit(msg):
+        sys.stdout.write("\r\x1b[K")                 # clear the prompt/thinking line
+        print_msg(msg)
+        redraw()
+
+    def thinking(responder):
+        sys.stdout.write(f"\r\x1b[K  {DIM}{responder.color}{responder.name}{RESET} is thinking...{RESET}")
+        sys.stdout.flush()
+    loop.on_thinking = thinking
+
+    try:
+        tty.setcbreak(fd)
+        sys.stdout.write("\x1b[?2004h")              # enable bracketed paste
+        redraw()
+        quit_now = False
+        while not quit_now:
+            if select.select([fd], [], [], 0.05)[0]:
+                data = os.read(fd, 4096)
+                if not data:                         # EOF (Ctrl-D on empty via pipe close)
+                    break
+                lines, eof = editor.feed(data.decode("utf-8", errors="replace"))
+                for line in lines:
+                    if line.strip().lower() in EXIT_WORDS:
+                        quit_now = True
+                        break
+                    if line.strip():
+                        loop.post_user_message(line)
+                        emit(history.messages[-1])
+                if eof:
+                    break
+                redraw()
+                if quit_now:
+                    break
+            msg = loop.step()
+            if msg is not None:
+                emit(msg)
+                time.sleep(args.delay)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        restore()
+        print()                                       # leave the cursor on a fresh line
+        _save(history, args, default_dir)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fluid terminal group chat with AI agents")
     parser.add_argument("topic_words", nargs="*",
@@ -267,45 +440,13 @@ def main():
     else:
         print(f"\n  {DIM}Start typing your first message and press Enter...{RESET}")
 
-    inp = UserInputThread()
-    inp.start()
-
-    def handle_user(item):
-        """Handle a user line. Returns False if we should quit."""
-        if item is _EOF:
-            return False
-        if item.strip().lower() in EXIT_WORDS:
-            return False
-        if item.strip():
-            loop.post_user_message(item)
-            print_msg(history.messages[-1])
-        return True
-
     default_dir = Path(__file__).resolve().parent / "chats"
-    try:
-        while True:
-            # 1. drain the user's input BEFORE the next agent turn
-            item = inp.get_input()
-            if item is not None:
-                if not handle_user(item):
-                    break
-                continue
-            # 2. one agent turn, if the burst isn't spent
-            msg = loop.step()
-            if msg is not None:
-                print_done()
-                print_msg(msg)
-                time.sleep(args.delay)
-                continue
-            # 3. idle: wait for the user
-            if not handle_user(inp.wait_for_input()):
-                break
-    except KeyboardInterrupt:
-        pass
-    finally:
-        inp.stop()
-        save_path = args.save or str(default_dir / f"chat-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md")
-        save_chat(history, save_path)
+    # A real TTY gets the raw-mode line editor (typing survives agent output);
+    # pipes / redirected input / tests use the line-based reader.
+    if _HAS_TERMIOS and sys.stdin.isatty() and sys.stdout.isatty():
+        run_interactive(loop, history, args, default_dir)
+    else:
+        run_piped(loop, history, args, default_dir)
 
 
 if __name__ == "__main__":

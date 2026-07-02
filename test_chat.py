@@ -320,6 +320,71 @@ class TestClaudeSubprocess(unittest.TestCase):
         self.assertIn("Glob", captured["cmd"])
 
 
+class TestLineEditor(unittest.TestCase):
+    def _ed(self):
+        from main import LineEditor
+        return LineEditor()
+
+    def test_printable_then_enter_submits(self):
+        ed = self._ed()
+        lines, eof = ed.feed("hello world\r")
+        self.assertEqual(lines, ["hello world"])
+        self.assertEqual(ed.buf, "")
+        self.assertFalse(eof)
+
+    def test_newline_also_submits(self):
+        ed = self._ed()
+        self.assertEqual(ed.feed("hi\n")[0], ["hi"])
+
+    def test_backspace_deletes_last_char(self):
+        ed = self._ed()
+        ed.feed("helllo")
+        ed.feed("\x7f")           # DEL
+        ed.feed("\x08")           # BS
+        self.assertEqual(ed.buf, "hell")
+
+    def test_two_lines_in_one_feed(self):
+        ed = self._ed()
+        self.assertEqual(ed.feed("one\rtwo\r")[0], ["one", "two"])
+
+    def test_ctrl_d_on_empty_is_eof(self):
+        ed = self._ed()
+        lines, eof = ed.feed("\x04")
+        self.assertTrue(eof)
+        self.assertEqual(lines, [])
+
+    def test_ctrl_d_with_text_is_ignored(self):
+        ed = self._ed()
+        _, eof = ed.feed("abc\x04")
+        self.assertFalse(eof)
+        self.assertEqual(ed.buf, "abc")
+
+    def test_arrow_keys_are_swallowed(self):
+        ed = self._ed()
+        lines, _ = ed.feed("ab\x1b[Dcd\x1b[A\r")   # left arrow, up arrow -> ignored
+        self.assertEqual(lines, ["abcd"])
+
+    def test_escape_split_across_feeds(self):
+        ed = self._ed()
+        ed.feed("x\x1b")          # ESC arrives...
+        ed.feed("[C")             # ...right-arrow finishes on the next read
+        lines, _ = ed.feed("y\r")
+        self.assertEqual(lines, ["xy"])
+
+    def test_bracketed_paste_is_one_line_with_newlines_kept(self):
+        ed = self._ed()
+        ed.feed("\x1b[200~line1\nline2\x1b[201~")   # paste (no Enter yet)
+        self.assertEqual(ed.buf, "line1\nline2")     # not submitted, newline kept
+        lines, _ = ed.feed("\r")                     # Enter submits the whole thing
+        self.assertEqual(lines, ["line1\nline2"])
+
+    def test_paste_markers_split_across_feeds(self):
+        ed = self._ed()
+        ed.feed("\x1b[200")                        # paste-start marker split...
+        lines, _ = ed.feed("~pasted\x1b[201~\r")   # ...completes here; \r submits
+        self.assertEqual(lines, ["pasted"])
+
+
 class TestRender(unittest.TestCase):
     def test_whitespace_only_long_line_is_not_dropped(self):
         import io
