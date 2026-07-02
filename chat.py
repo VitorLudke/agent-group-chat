@@ -216,59 +216,105 @@ def _is_quota_error(text):
     return "limit" in t and "rate limit" not in t
 
 
-class ClaudeCodeParticipant(Participant):
-    def __init__(self, name="Claude", color=CYAN, project_dir=None, model=None,
-                 system_prompt=None):
-        sp = system_prompt or (
-            "You are a senior software engineer in a group chat with other "
-            "engineers. You are peers. Respond in English. Be concise but "
-            "substantive. If you mention the code, VERIFY using the tools.")
-        super().__init__(name, color, sp)
+_CLI_DEFAULT_PROMPT = (
+    "You are a senior software engineer in a group chat with other "
+    "engineers. You are peers. Respond in English. Be concise but "
+    "substantive. If you mention the code, VERIFY using the tools.")
+
+
+class CliAgentParticipant(Participant):
+    """A seat backed by a headless agent CLI (Claude Code, Hermes, ...).
+    Owns subprocess/timeout/env-scrub/cwd/quota handling; subclasses only say
+    HOW to invoke it (_build_call) and HOW to parse its output (_parse)."""
+    cli_label = "CLI"
+
+    def __init__(self, name, color, cli_bin, project_dir=None, model=None, system_prompt=None):
+        super().__init__(name, color, system_prompt or _CLI_DEFAULT_PROMPT)
+        self.cli_bin = cli_bin
         self.project_dir = project_dir
         self.model = model
+
+    def _build_call(self, prompt, workdir):
+        """Return (argv, stdin_or_None)."""
+        raise NotImplementedError
+
+    def _parse(self, stdout):
+        raise NotImplementedError
 
     def respond(self, history, project_dir=None):
         chat = history.format_for_agent()
         workdir = project_dir or self.project_dir
-        user_msg = (
+        prompt = (
             f"{self.system_prompt}\n\n"
             f"## Chat History\n\n{chat}\n\n"
             f"## Your Turn\n\nWrite your contribution to the chat. "
             f"If you need to check something in the code, use the tools.\n")
-        cmd = ["claude", "--print", "--output-format", "json"]
-        if self.model:
-            cmd.extend(["--model", self.model])
-        if workdir:
-            cmd.extend(["--add-dir", workdir])
-        # READ-ONLY allowlist: the prompt includes untrusted text (output from
-        # other agents + the user), so a prompt injection can't mutate or execute.
-        # Note: `find` is deliberately excluded — `find -exec/-delete` would be an
-        # execution/deletion hole; use Glob/Grep to locate files instead.
-        cmd.extend(["--allowedTools",
-                    "Bash(ls *)", "Bash(cat *)", "Bash(grep *)", "Bash(wc *)",
-                    "Bash(git status *)", "Bash(git log *)",
-                    "Bash(git diff *)", "Bash(git show *)",
-                    "Read", "Glob", "Grep"])
-        # Run inside the project so ls/git see it, and scrub the OpenRouter key
-        # from the child env so a read tool (cat) can't exfiltrate it.
+        argv, stdin = self._build_call(prompt, workdir)
+        # Scrub the OpenRouter key from the child env so a read tool (cat) can't
+        # exfiltrate it; only chdir into a real directory.
         child_env = {k: v for k, v in os.environ.items() if k != "OPENROUTER_API_KEY"}
-        # only chdir into a real directory — a bad path would make subprocess.run
-        # raise FileNotFoundError from the child's chdir (before exec), which the
-        # fallback would misread as "claude not installed".
         cwd = workdir if workdir and os.path.isdir(workdir) else None
         result = subprocess.run(
-            cmd, input=user_msg, capture_output=True, text=True, timeout=300,
+            argv, input=stdin, capture_output=True, text=True, timeout=300,
             cwd=cwd, env=child_env)
         if result.returncode != 0:
             stderr = result.stderr.strip()
             if _is_quota_error(stderr):
-                raise RuntimeError(f"Claude CLI usage limit reached: {stderr[:120]}")
-            raise RuntimeError(f"Claude CLI error: {stderr[:200]}")
+                raise RuntimeError(f"{self.cli_label} usage limit reached: {stderr[:120]}")
+            raise RuntimeError(f"{self.cli_label} error: {stderr[:200]}")
+        return self._parse(result.stdout)
+
+
+class ClaudeCliParticipant(CliAgentParticipant):
+    cli_label = "Claude CLI"
+
+    def __init__(self, name="Claude", color=CYAN, cli_bin="claude", **kw):
+        super().__init__(name, color, cli_bin, **kw)
+
+    def _build_call(self, prompt, workdir):
+        argv = [self.cli_bin, "--print", "--output-format", "json"]
+        if self.model:
+            argv += ["--model", self.model]
+        if workdir:
+            argv += ["--add-dir", workdir]
+        # READ-ONLY allowlist: the prompt includes untrusted text (output from
+        # other agents + the user), so a prompt injection can't mutate or execute.
+        # Note: `find` is deliberately excluded — `find -exec/-delete` would be an
+        # execution/deletion hole; use Glob/Grep to locate files instead.
+        argv += ["--allowedTools",
+                 "Bash(ls *)", "Bash(cat *)", "Bash(grep *)", "Bash(wc *)",
+                 "Bash(git status *)", "Bash(git log *)",
+                 "Bash(git diff *)", "Bash(git show *)",
+                 "Read", "Glob", "Grep"]
+        return argv, prompt        # prompt via stdin
+
+    def _parse(self, stdout):
         try:
-            data = json.loads(result.stdout)
-            return data.get("result", result.stdout).strip()
+            return json.loads(stdout).get("result", stdout).strip()
         except json.JSONDecodeError:
-            return result.stdout.strip()
+            return stdout.strip()
+
+
+class HermesCliParticipant(CliAgentParticipant):
+    cli_label = "Hermes CLI"
+
+    def __init__(self, name="Hermes", color=YELLOW, cli_bin="hermes", **kw):
+        super().__init__(name, color, cli_bin, **kw)
+
+    def _build_call(self, prompt, workdir):
+        # runs with cwd=project (the base handles cwd) -> ripgrep/ls see the project.
+        argv = [self.cli_bin, "-z", prompt, "--yolo"]
+        if self.model:
+            argv += ["-m", self.model]
+        return argv, None          # prompt via argument, no stdin
+
+    def _parse(self, stdout):
+        return stdout.strip()
+
+
+# Compat alias: main.py still imports/uses ClaudeCodeParticipant, and the
+# default roster is unchanged — this keeps that name working.
+ClaudeCodeParticipant = ClaudeCliParticipant
 
 
 class FallbackParticipant(Participant):

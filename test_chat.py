@@ -7,7 +7,7 @@ from unittest import mock
 import chat
 from chat import (ChatHistory, ChatMessage, ChatLoop, Participant,
                   UserParticipant, FallbackParticipant, OpenRouterParticipant,
-                  ClaudeCodeParticipant)
+                  ClaudeCliParticipant, HermesCliParticipant)
 
 
 def mk_history(*pairs):
@@ -286,7 +286,7 @@ class TestClaudeSubprocess(unittest.TestCase):
             return self._Result()
         with mock.patch.object(chat.subprocess, "run", fake_run), \
                 mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "secret"}):
-            p = ClaudeCodeParticipant(project_dir=project_dir)
+            p = ClaudeCliParticipant(project_dir=project_dir)
             out = p.respond(mk_history(("You", "hi")))
         return out, captured
 
@@ -314,10 +314,64 @@ class TestClaudeSubprocess(unittest.TestCase):
             captured["cmd"] = cmd
             return self._Result()
         with mock.patch.object(chat.subprocess, "run", fake_run):
-            ClaudeCodeParticipant().respond(mk_history(("You", "hi")))
+            ClaudeCliParticipant().respond(mk_history(("You", "hi")))
         joined = " ".join(captured["cmd"])
         self.assertNotIn("Bash(find", joined)     # find -exec/-delete hole removed
         self.assertIn("Glob", captured["cmd"])
+
+
+class TestClaudeCli(unittest.TestCase):
+    def test_build_call_flags_and_stdin(self):
+        p = ClaudeCliParticipant(model="claude-x", system_prompt="persona")
+        argv, stdin = p._build_call("PROMPT", "/tmp")
+        self.assertEqual(argv[:4], ["claude", "--print", "--output-format", "json"])
+        self.assertIn("--model", argv); self.assertIn("claude-x", argv)
+        self.assertIn("--add-dir", argv); self.assertIn("/tmp", argv)
+        self.assertIn("Glob", argv)
+        self.assertNotIn("Bash(find *)", argv)   # find stays excluded
+        self.assertEqual(stdin, "PROMPT")         # prompt via stdin
+
+    def test_build_call_custom_bin_and_no_model(self):
+        p = ClaudeCliParticipant(cli_bin="/opt/claude")
+        argv, stdin = p._build_call("P", None)
+        self.assertEqual(argv[0], "/opt/claude")
+        self.assertNotIn("--model", argv)
+        self.assertNotIn("--add-dir", argv)
+
+    def test_parse_json_result_or_raw(self):
+        p = ClaudeCliParticipant()
+        self.assertEqual(p._parse('{"result": "hi"}'), "hi")
+        self.assertEqual(p._parse("not json"), "not json")
+
+
+class TestHermesCli(unittest.TestCase):
+    def test_build_call_prompt_via_arg_no_stdin(self):
+        p = HermesCliParticipant(model="deepseek/deepseek-v4-pro")
+        argv, stdin = p._build_call("PROMPT", "/tmp")
+        self.assertEqual(argv, ["hermes", "-z", "PROMPT", "--yolo",
+                                "-m", "deepseek/deepseek-v4-pro"])
+        self.assertIsNone(stdin)          # prompt goes in argv, not stdin
+
+    def test_build_call_no_model_custom_bin(self):
+        p = HermesCliParticipant(cli_bin="/opt/hermes")
+        argv, stdin = p._build_call("P", None)
+        self.assertEqual(argv, ["/opt/hermes", "-z", "P", "--yolo"])
+
+    def test_parse_plain_text_stripped(self):
+        self.assertEqual(HermesCliParticipant()._parse("  reply \n"), "reply")
+
+    def test_respond_runs_and_parses(self):
+        class R:
+            returncode = 0; stdout = "  my reply  "; stderr = ""
+        captured = {}
+        def fake_run(argv, **kw):
+            captured["argv"] = argv; captured["input"] = kw.get("input")
+            return R()
+        with mock.patch.object(chat.subprocess, "run", fake_run):
+            out = HermesCliParticipant(model="z-ai/glm-5.2").respond(mk_history(("You", "hi")))
+        self.assertEqual(out, "my reply")
+        self.assertEqual(captured["argv"][0], "hermes")
+        self.assertIsNone(captured["input"])   # no stdin
 
 
 class TestLineEditor(unittest.TestCase):

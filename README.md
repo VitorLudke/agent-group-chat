@@ -120,6 +120,16 @@ alias groupchat='python3 /path/to/agent-group-chat/main.py'
 - `main.py` — UI: non-blocking input (`select` + `os.read` on a background thread),
   rendering, and the persona roster.
 
+## Bring your own agent CLI
+
+Any headless agent CLI can back a seat, not just Claude Code. A seat is a
+`CliAgentParticipant` subclass that says how to invoke the CLI (`_build_call` →
+argv + optional stdin) and how to parse its output (`_parse`). `ClaudeCliParticipant`
+(`claude --print`) and `HermesCliParticipant` (`hermes -z --yolo`) ship as examples.
+Wire one into `build_participants` and it debates with its own tools — reading your
+code, browsing — instead of arguing blind. CLI seats run with whatever the command
+grants; prefer read-only flags for anything fed untrusted chat text.
+
 ## Customizing the agents
 
 The personas are plain constants and the roster is one function — both in
