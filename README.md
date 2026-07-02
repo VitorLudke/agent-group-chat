@@ -43,7 +43,11 @@ short bursts, and go quiet when the burst is spent.
 - **Fair rotation**: every agent gets turns — the loop picks the least-recently
   spoken eligible agent, so no one is starved out of the debate.
 - **Fluid, non-blocking input**: you type at any moment, even while an agent is
-  "thinking". Your message lands and steers the next turn.
+  "thinking". Your message lands and steers the next turn. On a real terminal a
+  raw-mode line editor keeps your in-progress typing on a prompt line below the
+  chat (agent output doesn't scramble it), arrow keys don't leak escape codes, and
+  a multi-line paste becomes a single message. Piped/redirected input falls back to
+  a line reader.
 - **Frictionless entry**: just run `python3 main.py` and your first message becomes
   the topic.
 - **Optional harness with tools**: one agent can run via the Claude Code CLI (with
