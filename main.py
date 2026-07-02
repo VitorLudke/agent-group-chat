@@ -16,6 +16,7 @@ Note: uses select() on stdin — macOS/Linux only (not Windows).
 import argparse
 import os
 import queue
+import signal
 import sys
 import time
 import threading
@@ -221,6 +222,19 @@ def main():
         parser.error("--max-turns must be >= 1")
     if args.context_window < 1:
         parser.error("--context-window must be >= 1")
+
+    # Closing the terminal (SIGHUP) or `kill` (SIGTERM) should still save, not
+    # drop the transcript. Route them through the same KeyboardInterrupt path as
+    # Ctrl-C so the finally-block save runs.
+    def _save_and_quit(signum, frame):
+        raise KeyboardInterrupt
+    for _signame in ("SIGTERM", "SIGHUP"):
+        _sig = getattr(signal, _signame, None)
+        if _sig is not None:
+            try:
+                signal.signal(_sig, _save_and_quit)
+            except (ValueError, OSError):
+                pass   # not the main thread / not supported here
 
     if sys.platform == "win32":
         print(f"{RED}Note:{RESET} non-blocking input uses select() on stdin, which is "
